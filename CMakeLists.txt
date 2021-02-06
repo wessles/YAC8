@@ -7,7 +7,9 @@ find_package(SDL2 REQUIRED)
 
 include_directories(${SDL2_INCLUDE_DIR})
 
-add_executable(yac8 main.cpp c8_window_sdl2.cpp c8_context.cpp)
+file(GLOB yac8_SRC "./**.cpp" "./imgui/*.cpp")
+
+add_executable(yac8  ${yac8_SRC})
 target_link_libraries(yac8 ${SDL2_LIBRARY})
 
 # Copy SDL2 DLLs to output folder on Windows
