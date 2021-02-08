@@ -1,6 +1,5 @@
 #include "c8_noisemaker.hpp"
-#include <math.h>
-#include <SDL.h>
+
 #include <SDL_audio.h>
 #include <iostream>
 

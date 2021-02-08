@@ -1,7 +1,7 @@
 #pragma once
 
 namespace yac8 {
-    /*
+    /**
      * A struct for specifying emulation "quirks" that certain games expect.
      */
     struct c8_quirks {

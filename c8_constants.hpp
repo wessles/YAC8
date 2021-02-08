@@ -1,5 +1,9 @@
 #pragma once
 
+/**
+ * This file contains all the constants you'll need to run Chip8.
+ */
+
 namespace yac8 {
     const int
         V_REGISTERS_SIZE = 0x10,
@@ -7,9 +11,7 @@ namespace yac8 {
         PROGRAM_OFFSET = 0x200, // 512
         STACK_SIZE = 0x10, // 16
         WINDOW_WIDTH = 64,
-        WINDOW_HEIGHT = 32,
-        SPRITE_BYTE_WIDTH = 1,
-        SPRITE_HEIGHT = 5;
+        WINDOW_HEIGHT = 32;
 
     const uint16_t default_typography_buffer[80] = {
         0xF0,0x90,0x90,0x90,0xF0,

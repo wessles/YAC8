@@ -32,13 +32,15 @@ namespace yac8 {
             0x8078,0x0870,0x00f0,
     };
 
-
+    /**
+     * A POD struct of state for the debugger.
+     */
     struct c8_debugger_state {
         bool enabled = false;
         bool paused = false;
         bool step = false;
         bool freezeTimers = false;
-        int lastPC = -1;
+
         bool breakJP = false;
         bool breakDRW = false;
         bool breakLDK = false;
@@ -46,10 +48,11 @@ namespace yac8 {
         bool breakPoints[RAM_SIZE-PROGRAM_OFFSET] = {false};
     };
 
+    /**
+     * A big class containing all the SDL/OpenGL/ImGui code used in running the emulator.
+     */
     class c8_emulator {
-
         GLuint screenBufferTex = 0;
-        bool screenUpdateFlag = false;
 
         float bgColor[4] = {15.0f/255.0f, 35.0f/255.0f, 17.0f/255.0f};
         float fgColor[4] = {141.0f/255.0f, 255.0f/255.0f, 128.0f/255.0f};
@@ -57,6 +60,9 @@ namespace yac8 {
         int scanLineMult = 1250;
         float softness = 4.0f;
         float screenDecayFactor = 0.7f;
+
+        void clearScreen();
+        void drawSprite(const uint8_t *sprite, uint8_t x, uint8_t y, uint8_t n, uint8_t &VF);
 
     public:
         bool pixels[WINDOW_WIDTH * WINDOW_HEIGHT] = {0};
@@ -67,7 +73,5 @@ namespace yac8 {
         c8_debugger_state debug_state{};
 
         void run();
-        void clearScreen();
-        void drawSprite(const uint8_t *sprite, uint8_t x, uint8_t y, uint8_t n, uint8_t &VF);
     };
 }

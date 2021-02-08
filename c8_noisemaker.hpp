@@ -3,6 +3,9 @@
 #include <SDL_audio.h>
 
 namespace yac8 {
+    /**
+     * A class for playing a square-wave beep continuously, using SDL2's Audio Queue API
+     */
     class c8_noisemaker {
     private:
         SDL_AudioSpec audio_spec;

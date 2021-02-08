@@ -10,6 +10,10 @@
 namespace yac8 {
     const uint8_t NO_LAST_KEY = 0xFF;
 
+    /**
+     * This class contains all state associated with the Chip-8 "CPU", including registers, RAM, etc.
+     * Some of these registers are "hardware registers" which can only be modified by `c8_emulator`
+     */
     class c8_state {
     public:
         // 16-bit program counter

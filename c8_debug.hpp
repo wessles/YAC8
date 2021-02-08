@@ -1,6 +1,11 @@
 #pragma once
 
+/**
+ * This file simply holds a function which informatively describes an opcode. Used in the debugger.
+ */
+
 #include <sstream>
+#include <iomanip>
 
 namespace yac8 {
 
