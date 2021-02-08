@@ -37,7 +37,6 @@ namespace yac8 {
         c8_state();
         void loadTypography(const uint16_t *typography);
         void loadROM(const uint8_t *rom, int size);
-        void step(c8_hardware_api &window, c8_quirks quirks);
-        void dump();
+        bool step(c8_hardware_api &window, c8_quirks quirks);
     };
 }

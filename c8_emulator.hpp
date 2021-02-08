@@ -1,8 +1,10 @@
 #pragma once
 
 #include <SDL.h>
+#undef main
 #include <string>
 #include <unordered_map>
+#include <glad/glad.h>
 
 #include "c8_constants.hpp"
 #include "c8_state.hpp"
@@ -10,7 +12,7 @@
 namespace yac8 {
     // accounts for the size of the menu bar
     const int VIEWPORT_Y_OFFSET = 19;
-    const int MAX_SPEED = 1000;
+    const int MAX_SPEED = 4000;
 
     // egomaniacal bootup sequence
     const uint16_t DEMO_ROM[] = {
@@ -30,20 +32,40 @@ namespace yac8 {
             0x8078,0x0870,0x00f0,
     };
 
+
+    struct c8_debugger_state {
+        bool enabled = false;
+        bool paused = false;
+        bool step = false;
+        bool freezeTimers = false;
+        int lastPC = -1;
+        bool breakJP = false;
+        bool breakDRW = false;
+        bool breakLDK = false;
+        bool breakSKP = false;
+        bool breakPoints[RAM_SIZE-PROGRAM_OFFSET] = {false};
+    };
+
     class c8_emulator {
-        SDL_Renderer *renderer;
-        SDL_Texture *screenBuffer;
-        bool pixels[WINDOW_WIDTH * WINDOW_HEIGHT] = {0};
+
+        GLuint screenBufferTex = 0;
+        bool screenUpdateFlag = false;
 
         float bgColor[4] = {15.0f/255.0f, 35.0f/255.0f, 17.0f/255.0f};
         float fgColor[4] = {141.0f/255.0f, 255.0f/255.0f, 128.0f/255.0f};
-        c8_quirks quirks{};
-        int processorSpeed = MAX_SPEED;
+        float screenCurveX = 0.25f, screenCurveY = 0.25f;
+        int scanLineMult = 1250;
+        float softness = 5.0f;
 
     public:
+        uint8_t pixels[WINDOW_WIDTH * WINDOW_HEIGHT] = {0};
+        int processorSpeed = 1000;
+        bool slowedProcessorSpeed = true;
+        c8_quirks quirks{};
+        c8_debugger_state debug_state{};
+
         void run();
         void clearScreen();
-        void redrawScreen();
         void drawSprite(const uint8_t *sprite, uint8_t x, uint8_t y, uint8_t n, uint8_t &VF);
     };
 }

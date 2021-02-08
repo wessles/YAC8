@@ -15,15 +15,10 @@ using std::string;
 #include "c8_constants.hpp"
 #include "c8_state.hpp"
 #include "c8_emulator.hpp"
-#include "imgui/imgui.h"
-#include "imgui/imgui_sdl.h"
-
-#include <thread>
-#include <windows.h>
 
 using namespace yac8;
 
-int main(int argc, char *argv[])
+int main()
 {
     c8_emulator emu;
     emu.run();

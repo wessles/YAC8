@@ -1,20 +1,29 @@
 #include "c8_emulator.hpp"
 
+#include <SDL.h>
+
 #include "c8_state.hpp"
 
+#include <glad/glad.h>
 #include "imgui/imgui.h"
-#include "imgui/imgui_sdl.h"
+#include "imgui/backends/imgui_impl_sdl.h"
+#include "imgui/backends/imgui_impl_opengl3.h"
 
 #include <algorithm>
 #include <chrono>
 #include <random>
 #include <thread>
-#include <windows.h>
 #include <string>
 #include <map>
 #include <unordered_map>
 #include <fstream>
 #include <iostream>
+#include <Windows.h>
+#include <thread>
+#include <iomanip>
+#include <mutex>
+
+#include "c8_debug.hpp"
 
 using std::string;
 
@@ -62,21 +71,202 @@ namespace yac8 {
         }
     }
 
+    // Shader sources
+    const GLchar* vertexSource =
+        "#version 150\n"
+        "attribute vec4 position;\n"
+        "out vec2 texCoord;"
+        "void main()\n"
+        "{\n"
+        "float x = -1.0 + float((gl_VertexID & 1) << 2);\n"
+        "float y = -1.0 + float((gl_VertexID & 2) << 1);\n"
+        "texCoord.x = (x+1.0)*0.5;\n"
+        "texCoord.y = (y+1.0)*0.5;\n"
+        "gl_Position = vec4(x, y, 0, 1);\n"
+        "}\n";
+    const GLchar* fragmentSource =
+        "#version 150\n"
+        "\n"
+        "\n"
+        "uniform sampler2D tex;\n"
+        "uniform vec4 background;\n"
+        "uniform vec4 foreground;\n"
+        "\n"
+        "in vec2 texCoord;\n"
+        "\n"
+        "out vec4 fragColor;\n"
+        "\n"
+        "uniform float CRT_CURVE_AMNTx;\n"
+        "uniform float CRT_CURVE_AMNTy;\n"
+        "uniform float SCAN_LINE_MULT;\n"
+        "uniform float e;\n"
+        "\n"
+        "void main() {\n"
+        "\tfor(int x = -3; x <= 3; x++) {\n"
+        "\t\tfor(int y = -3; y <= 3; y++) {\n"
+        "\t\t\tvec2 tc = texCoord + e*vec2(x,y);\n"
+        "\t\t\tfloat dx = abs(0.5-tc.x);\n"
+        "\t\t\tfloat dy = abs(0.5-tc.y);\n"
+        "\t\t\tdx *= dx;\n"
+        "\t\t\tdy *= dy;\n"
+        "\t\t\ttc.x -= 0.5;\n"
+        "\t\t\ttc.x *= 1.0 + (dy * CRT_CURVE_AMNTx);\n"
+        "\t\t\ttc.x += 0.5;\n"
+        "\t\t\ttc.y -= 0.5;\n"
+        "\t\t\ttc.y *= 1.0 + (dx * CRT_CURVE_AMNTy);\n"
+        "\t\t\ttc.y += 0.5;\n"
+        "\t\t\tbool a = texture(tex, vec2(tc.x, 1.0-tc.y)).r > 0;\n"
+        "\t\t\tbool b = tc.y > 1.0 || tc.x < 0.0 || tc.x > 1.0 || tc.y < 0.0;\n"
+        "\t\t\tfragColor += float(!b)*(background * float(!a) + foreground * float(a) + sin(tc.y * SCAN_LINE_MULT) * 0.02) / 49.0;\n"
+        "\t\t}\n"
+        "\t}\n"
+        "}";
+
+    void emulationThread(
+            std::mutex &state_mutex,
+             const bool *running,
+             bool *incompatible_flag,
+             c8_emulator & emu,
+             c8_hardware_api & hardware_api,
+             c8_state & state) {
+        using clock = std::chrono::high_resolution_clock;
+        auto frame_start = clock::now();
+
+        while(*running) {
+            // step chip8 simulation if it's time
+            if(clock::now() - frame_start >= std::chrono::microseconds(1000000 / emu.processorSpeed)) {
+                state_mutex.lock();
+
+                if(!emu.debug_state.paused || emu.debug_state.step) {
+                    emu.debug_state.step = false;
+                    emu.debug_state.lastPC = state.pc;
+                    if(!state.step(hardware_api, emu.quirks)) {
+                        *incompatible_flag = true;
+                    }
+                }
+
+                // if not paused, evaluate any breakpoints
+                if(!emu.debug_state.paused) {
+                    // evaluate regular breakpoints
+                    if(emu.debug_state.breakPoints[state.pc - PROGRAM_OFFSET]) {
+                        emu.debug_state.paused = true;
+                    }
+
+                    uint16_t inst = (uint16_t) (state.ram[state.pc] << 8) | (uint16_t) (state.ram[state.pc + 1]);
+                    uint8_t A = (inst & 0xF000) >> 12;
+                    // break on any draw call
+                    if (emu.debug_state.breakDRW && A == 0xD) {
+                        emu.debug_state.breakDRW = false;
+                        emu.debug_state.paused = true;
+                    }
+                    // break on any JP,CALL,RET, or skip instruction
+                    if (emu.debug_state.breakJP && (
+                            inst == 0x00EE
+                            || A == 0x1
+                            || A == 0x2
+                            || A == 0x3
+                            || A == 0x4
+                            || A == 0x5
+                            || A == 0x9
+                            || A == 0xB
+                    )) {
+                        emu.debug_state.breakJP = false;
+                        emu.debug_state.paused = true;
+                    }
+                    // break on wait for keypress
+                    if(emu.debug_state.breakLDK && (inst&0xF0FF) == 0xF00A) {
+                        emu.debug_state.breakLDK = false;
+                        emu.debug_state.paused = true;
+                    }
+                    // break on key skip
+                    if(emu.debug_state.breakSKP && (inst&0xF000) == 0xE000) {
+                        emu.debug_state.breakSKP = false;
+                        emu.debug_state.paused = true;
+                    }
+                }
+
+                state_mutex.unlock();
+                frame_start = clock::now();
+                std::this_thread::yield();
+                if(emu.slowedProcessorSpeed) {
+                    SDL_Delay(1);
+                }
+            }
+        }
+    }
+
     void c8_emulator::run() {
         int scale = 20;
 
         SDL_Init(SDL_INIT_EVERYTHING);
-        SDL_Window *window = SDL_CreateWindow("YAC8", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WINDOW_WIDTH * scale, WINDOW_HEIGHT * scale + VIEWPORT_Y_OFFSET, 0);
-        this->renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+        SDL_Window *window = SDL_CreateWindow("YAC8", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WINDOW_WIDTH * scale, WINDOW_HEIGHT * scale + VIEWPORT_Y_OFFSET, SDL_WINDOW_OPENGL);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+        // cap framerate on this thread
+        SDL_GL_SetSwapInterval(1);
+
+        SDL_GLContext context = SDL_GL_CreateContext(window);
+        gladLoadGL();
         ImGui::CreateContext();
-        ImGuiSDL::Initialize(renderer, WINDOW_WIDTH * scale, WINDOW_HEIGHT * scale);
-        this->screenBuffer = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, WINDOW_WIDTH, WINDOW_HEIGHT);
-        {
-            SDL_SetRenderTarget(renderer, screenBuffer);
-            SDL_SetRenderDrawColor(renderer, 255, 0, 255, 255);
-            SDL_RenderClear(renderer);
-            SDL_SetRenderTarget(renderer, nullptr);
+        ImGui_ImplSDL2_InitForOpenGL(window, context);
+        ImGui_ImplOpenGL3_Init();
+
+        glEnable(GL_MULTISAMPLE);
+
+
+        // Create Vertex Array Object
+        GLuint vao;
+        glGenVertexArrays(1, &vao);
+        glBindVertexArray(vao);
+
+        // Create a Vertex Buffer Object and copy the vertex data to it
+        GLuint vbo;
+        glGenBuffers(1, &vbo);
+
+        GLfloat vertices[] = {0.0f, 0.5f, 0.5f, -0.5f, -0.5f, -0.5f};
+
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+
+        // Create and compile the vertex shader
+        GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(vertexShader, 1, &vertexSource, NULL);
+        glCompileShader(vertexShader);
+        GLint isCompiled = 0;
+        glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &isCompiled);
+        if(isCompiled == GL_FALSE) {
+            GLint maxLength = 0;
+            glGetShaderiv(vertexShader, GL_INFO_LOG_LENGTH, &maxLength);
+
+            // The maxLength includes the NULL character
+            std::vector<GLchar> errorLog(maxLength);
+            glGetShaderInfoLog(vertexShader, maxLength, &maxLength, &errorLog[0]);
+            std::cout << errorLog.data() << std::endl;
         }
+
+        // Create and compile the fragment shader
+        GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(fragmentShader, 1, &fragmentSource, NULL);
+        glCompileShader(fragmentShader);
+        isCompiled = 0;
+        glGetShaderiv(fragmentShader, GL_COMPILE_STATUS, &isCompiled);
+        if(isCompiled == GL_FALSE) {
+            GLint maxLength = 0;
+            glGetShaderiv(fragmentShader, GL_INFO_LOG_LENGTH, &maxLength);
+
+            // The maxLength includes the NULL character
+            std::vector<GLchar> errorLog(maxLength);
+            glGetShaderInfoLog(fragmentShader, maxLength, &maxLength, &errorLog[0]);
+            std::cout << errorLog.data() << std::endl;
+        }
+
+        // Link the vertex and fragment shader into a shader program
+        GLuint shaderProgram = glCreateProgram();
+        glAttachShader(shaderProgram, vertexShader);
+        glAttachShader(shaderProgram, fragmentShader);
+        glLinkProgram(shaderProgram);
 
         // setup hardware API hooks
         c8_hardware_api hardware_api{};
@@ -89,7 +279,17 @@ namespace yac8 {
         // setup timers
         using clock = std::chrono::high_resolution_clock;
         auto last_timer_tick = clock::now();
-        auto frame_start = clock::now();
+
+        glGenTextures(1, &screenBufferTex);
+        glBindTexture(GL_TEXTURE_2D, screenBufferTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(
+            GL_TEXTURE_2D, 0, GL_R8,
+            WINDOW_WIDTH, WINDOW_HEIGHT,
+            0, GL_RED, GL_UNSIGNED_BYTE, pixels);
 
         // load initial demo rom
         std::vector<char> romData(sizeof(DEMO_ROM));
@@ -100,24 +300,34 @@ namespace yac8 {
         state.loadTypography(yac8::default_typography_buffer);
 
         bool run = true;
+        bool incompatible_flag = false;
+        bool incompatible_dismissed = false;
+        std::mutex state_mutex;
+        std::thread emuThread([&](){ emulationThread(state_mutex, &run, &incompatible_flag, *this, hardware_api, state); });
+
         while(run) {
             ImGuiIO& io = ImGui::GetIO();
 
             // handle timer ticks
-            auto timeSinceLastTick = clock::now() - last_timer_tick;
-            const auto tickInterval = std::chrono::milliseconds(1000/60);
-            if(timeSinceLastTick > tickInterval) {
-                if(state.dt != 0)
-                    state.dt -= 1;
-                if(state.st != 0)
-                    state.st -= 1;
-                last_timer_tick = clock::now();
+            if(!debug_state.enabled || !debug_state.freezeTimers) {
+                auto timeSinceLastTick = clock::now() - last_timer_tick;
+                const auto tickInterval = std::chrono::milliseconds(1000 / 60);
+                if (timeSinceLastTick > tickInterval) {
+                    if (state.dt != 0)
+                        state.dt -= 1;
+                    if (state.st != 0)
+                        state.st -= 1;
+                    last_timer_tick = clock::now();
+                }
             }
 
             bool reset = false;
+            bool loadRom = false;
+            string romFilename;
 
             // handle inputs
-            state.lastKey = yac8::NO_LAST_KEY;
+            if(!debug_state.paused)
+                state.lastKey = yac8::NO_LAST_KEY;
             SDL_Event e;
             int wheel = 0;
             while (SDL_PollEvent(&e))
@@ -125,17 +335,16 @@ namespace yac8 {
                 int k = SDL_to_c8_key(e.key.keysym.sym);
 
                 if (e.type == SDL_QUIT) run = false;
-                else if (e.type == SDL_WINDOWEVENT)
-                {
-                    if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
-                    {
+                else if (e.type == SDL_WINDOWEVENT) {
+                    if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                         io.DisplaySize.x = static_cast<float>(e.window.data1);
                         io.DisplaySize.y = static_cast<float>(e.window.data2);
                     }
-                }
-                else if (e.type == SDL_MOUSEWHEEL)
-                {
+                } else if (e.type == SDL_MOUSEWHEEL) {
                     wheel = e.wheel.y;
+                } else if(e.type == SDL_DROPFILE) {
+                    loadRom = true;
+                    romFilename = e.drop.file;
                 } else if(e.type == SDL_KEYUP) {
                     if(k > 0) {
                         state.keyStates[k] = false;
@@ -143,6 +352,10 @@ namespace yac8 {
                 } else if(e.type == SDL_KEYDOWN) {
                     if(e.key.keysym.sym == SDLK_BACKSPACE) {
                         reset = true;
+                    } else if(e.key.keysym.sym == SDLK_n) {
+                        debug_state.step = true;
+                    } else if(e.key.keysym.sym == SDLK_SPACE) {
+                        debug_state.paused = !debug_state.paused;
                     } else if(k > 0) {
                         if(state.lastKey == yac8::NO_LAST_KEY) {
                             state.lastKey = k;
@@ -150,12 +363,6 @@ namespace yac8 {
                         state.keyStates[k] = true;
                     }
                 }
-            }
-
-            // step chip8 simulation if it's time
-            if(clock::now() - frame_start >= std::chrono::microseconds(1000000 / (processorSpeed))) {
-                state.step(hardware_api, quirks);
-                frame_start = clock::now();
             }
 
             // handle imgui inputs
@@ -167,30 +374,19 @@ namespace yac8 {
             io.MouseDown[1] = buttons & SDL_BUTTON(SDL_BUTTON_RIGHT);
             io.MouseWheel = static_cast<float>(wheel);
 
-            // handle menus
+            // begin rendering menus / screen
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui_ImplSDL2_NewFrame(window);
             ImGui::NewFrame();
+
             if(ImGui::BeginMainMenuBar())
             {
                 if (ImGui::BeginMenu("File"))
                 {
                     if(ImGui::MenuItem("Open"))
                     {
-                        string romFileName = openROM();
-
-                        std::ifstream is(romFileName, std::ios::in|std::ios::binary|std::ios::ate);
-                        if(is.is_open()) {
-                            int size = is.tellg();
-                            romData.resize(size);
-                            is.seekg(0, std::ios::beg);
-                            is.read(&romData[0], size);
-                            is.close();
-
-                            state = {};
-                            state.loadROM((const uint8_t *) romData.data(), romData.size());
-                            state.loadTypography(yac8::default_typography_buffer);
-
-                            clearScreen();
-                        }
+                        loadRom = true;
+                        romFilename = openROM();
                     }
                     if(ImGui::MenuItem("Reset"))
                     {
@@ -204,78 +400,212 @@ namespace yac8 {
                     ImGui::Checkbox("Load/Store Quirk", &quirks.loadStoreQuirk);
                     ImGui::Checkbox("Shift Quirk", &quirks.shiftQuirk);
                     ImGui::Checkbox("Wrapping", &quirks.wrap);
+                    ImGui::Checkbox("Lock Processor Speed", &slowedProcessorSpeed);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Use thread sleep to limit CPU usage.\nTurning this off will make the emulation thread run faster, but makes CPU usage go nuts.");
                     ImGui::EndMenu();
                 }
                 if(ImGui::BeginMenu("Colors"))
                 {
-                    if(ImGui::ColorPicker3("Background Color", bgColor)) {
-                        redrawScreen();
-                    }
-                    if(ImGui::ColorPicker3("Foreground Color", fgColor)) {
-                        redrawScreen();
+                    ImGui::ColorPicker3("Background Color", bgColor);
+                    ImGui::ColorPicker3("Foreground Color", fgColor);
+                    ImGui::EndMenu();
+                }
+                if(ImGui::BeginMenu("Screen Simulation"))
+                {
+                    ImGui::SliderFloat("Screen Curve X", &screenCurveX, 0.0f, 2.0f);
+                    ImGui::SliderFloat("Screen Curve Y", &screenCurveY, 0.0f, 2.0f);
+                    ImGui::SliderInt("Scan Line Frequency", &scanLineMult, 0, 1250);
+                    ImGui::SliderFloat("Softness", &softness, 0.0f, 5.0f);
+                    ImGui::EndMenu();
+                }
+                if(ImGui::BeginMenu("Debugger")) {
+                    ImGui::Text("Debugger Controls:\n\t[N] Step\n\t[Spacebar] Pause/unpause");
+                    if(ImGui::Button("Toggle Debugger")) {
+                        debug_state.enabled = !debug_state.enabled;
                     }
                     ImGui::EndMenu();
                 }
                 if(ImGui::BeginMenu("Help")) {
-                    ImGui::Text("Game Controls:\n\t1234\n\tqwer\n\tasdf\n\tzxcv\nEmulator Controls:\n\t[Backspace] Reset");
+                    ImGui::Text("Game Controls:\n\t1234\n\tqwer\n\tasdf\n\tzxcv\nEmulator Controls:\n\t[Backspace] Reset\n\nYou can drag ROMs onto this window to load");
+                    ImGui::Separator();
+                    ImGui::Text("Created by Wes L, 2021");
+                    ImGui::Text("systemvoidgames.com");
                     ImGui::EndMenu();
                 }
                 ImGui::EndMainMenuBar();
             }
 
-            SDL_Rect rect;
-            rect.x = 0;
-            rect.y = VIEWPORT_Y_OFFSET;
-            rect.w = WINDOW_WIDTH * scale;
-            rect.h = WINDOW_HEIGHT * scale;
-            SDL_RenderCopy(renderer, screenBuffer, NULL, &rect);
+            if(ImGui::BeginPopup("Incompatible ROM")) {
+                ImGui::TextColored(ImVec4{1.0f, 0.0f, 0.0f, 1.0f}, "Unrecognized instructions detected.\nThis ROM may be incompatible.");
+                if(ImGui::Button("Ok")) {
+                    incompatible_dismissed = true;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+
+            if(incompatible_flag && !incompatible_dismissed) {
+                ImGui::OpenPopup("Incompatible ROM");
+            }
+
+            if(debug_state.enabled) {
+                if(ImGui::Begin("Debugger", &debug_state.enabled))
+                {
+                    if(incompatible_flag) {
+                        ImGui::TextColored(ImVec4{1.0f, 0.0f, 0.0f, 1.0f}, "Unrecognized instructions detected.\nThis ROM may be incompatible.");
+                    }
+                    ImGui::Columns(2);
+                    ImGui::TextColored(ImVec4{0.0f, 1.0f, 0.0f, 1.0f}, "%s", (string("PC=") + print_register(state.pc)).c_str());
+                    ImGui::TextColored(ImVec4{0.0f, 1.0f, 0.0f, 1.0f}, "%s", (string("SP=") + print_register(state.sp)).c_str());
+                    ImGui::TextColored(ImVec4{1.0f, 0.0f, 0.0f, 1.0f}, "%s", (string("I =") + print_register(state.I)).c_str());
+                    ImGui::TextColored(ImVec4{0.5f, 0.5f, 1.0f, 1.0f}, "%s", (string("DT=") + print_register(state.dt)).c_str());
+                    ImGui::TextColored(ImVec4{0.5f, 0.5f, 1.0f, 1.0f}, "%s", (string("ST=") + print_register(state.st)).c_str());
+                    ImGui::TextColored(ImVec4{1.0f, 1.0f, 0.0f, 1.0f}, "%s", (string("K =") + print_register(state.lastKey)).c_str());
+                    ImGui::NextColumn();
+                    for(int r = 0; r < V_REGISTERS_SIZE; r++) {
+                        ImGui::Text("%s", (string("V") + std::to_string(r) + "=" + print_register(state.v[r])).c_str());
+                    }
+
+                    ImGui::Separator();
+                    ImGui::Columns(1);
+
+                    ImGui::Checkbox("Paused", &debug_state.paused);
+                    ImGui::Checkbox("Freeze Timers", &debug_state.freezeTimers);
+                    if(ImGui::Button("Break on next (JP, CALL, RET)")) {
+                        debug_state.breakJP = true;
+                        debug_state.breakDRW = false;
+                        debug_state.breakLDK = false;
+                        debug_state.breakSKP = false;
+                        debug_state.paused = false;
+                    }
+                    if(ImGui::Button("Break on next Draw Call (DRW)")) {
+                        debug_state.breakJP = false;
+                        debug_state.breakDRW = true;
+                        debug_state.breakLDK = false;
+                        debug_state.breakSKP = false;
+                        debug_state.paused = false;
+                    }
+                    if(ImGui::Button("Break on next Keypress Wait (LD Vx, K)")) {
+                        debug_state.breakJP = false;
+                        debug_state.breakDRW = false;
+                        debug_state.breakLDK = true;
+                        debug_state.breakSKP = false;
+                        debug_state.paused = false;
+                    }
+                    if(ImGui::Button("Break on next Key Skip (SKP,SKNP)")) {
+                        debug_state.breakJP = false;
+                        debug_state.breakDRW = false;
+                        debug_state.breakLDK = false;
+                        debug_state.breakSKP = true;
+                        debug_state.paused = false;
+                    }
+                    if (ImGui::Button("Step")) {
+                        debug_state.step = true;
+                    }
+                    if(ImGui::Button("Clear Breakpoints")) {
+                        std::fill(debug_state.breakPoints, debug_state.breakPoints+sizeof(debug_state.breakPoints), false);
+                    }
+                }
+                ImGui::End();
+
+                ImGui::Begin("Instruction View");
+                    for (int i = -10; i <= 11; ++i) {
+                        int instNum = state.pc + i * 2;
+                        if(instNum < PROGRAM_OFFSET || instNum >= RAM_SIZE) {
+                            ImGui::Text("???");
+                        } else {
+                            bool isPC = instNum == state.pc;
+                            if (isPC) {
+                                ImGui::PushStyleColor(0, ImVec4{0.0f, 1.0f, 0.0f, 1.0f});
+                            }
+                            string instruction = print_instruction(instNum, state, quirks);
+                            ImGui::Selectable(instruction.c_str(), &debug_state.breakPoints[instNum - PROGRAM_OFFSET]);
+                            if (isPC) {
+                                ImGui::PopStyleColor();
+                            }
+                        }
+                    }
+                ImGui::End();
+            }
+
+            glClearColor(1.0f,0.0f,1.0f,1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+
+            glBindTexture(GL_TEXTURE_2D, screenBufferTex);
+
+            // expensive operation: copying pixel buffer from cpu to gpu
+            if(screenUpdateFlag) {
+                screenUpdateFlag = false;
+                glTexSubImage2D(
+                        GL_TEXTURE_2D, 0, 0, 0,
+                        WINDOW_WIDTH, WINDOW_HEIGHT,
+                        GL_RED, GL_UNSIGNED_BYTE, pixels);
+            }
+
+            glBindTexture(GL_TEXTURE_2D, screenBufferTex);
+            glActiveTexture(GL_TEXTURE0);
+
+            glUniform4f(glGetUniformLocation(shaderProgram, "background"),bgColor[0],bgColor[1],bgColor[2],1.0f);
+            glUniform4f(glGetUniformLocation(shaderProgram, "foreground"),fgColor[0],fgColor[1],fgColor[2],1.0f);
+            glUniform1f(glGetUniformLocation(shaderProgram, "CRT_CURVE_AMNTx"),screenCurveX);
+            glUniform1f(glGetUniformLocation(shaderProgram, "CRT_CURVE_AMNTy"),screenCurveY);
+            glUniform1f(glGetUniformLocation(shaderProgram, "SCAN_LINE_MULT"),(float)scanLineMult);
+            glUniform1f(glGetUniformLocation(shaderProgram, "e"), softness / 10000.0f);
+
+            glViewport(0,0,WINDOW_WIDTH*scale,WINDOW_HEIGHT*scale);
+
+            glUseProgram(shaderProgram);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
 
             ImGui::Render();
-            ImGuiSDL::Render(ImGui::GetDrawData());
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            SDL_GL_SwapWindow(window);
+            SDL_Delay(1000/120);
 
-            SDL_RenderPresent(renderer);
+            if(loadRom) {
+                std::ifstream is(romFilename, std::ios::in|std::ios::binary|std::ios::ate);
+                if(is.is_open()) {
+                    int size = is.tellg();
+                    romData.resize(size);
+                    is.seekg(0, std::ios::beg);
+                    is.read(&romData[0], size);
+                    is.close();
 
+                    // remove breakpoints
+                    std::fill(debug_state.breakPoints, debug_state.breakPoints+sizeof(debug_state.breakPoints), false);
+
+                    // remove incompatibility flag
+                    incompatible_flag = false;
+                    incompatible_dismissed = false;
+
+                    reset = true;
+                }
+            }
             if(reset) {
+                state_mutex.lock();
                 state = {};
                 clearScreen();
                 state.loadROM((const uint8_t *) romData.data(), romData.size());
                 state.loadTypography(yac8::default_typography_buffer);
+                state_mutex.unlock();
             }
         }
+        emuThread.join();
 
-        ImGuiSDL::Deinitialize();
-
-        SDL_DestroyRenderer(renderer);
-        SDL_DestroyWindow(window);
-
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplSDL2_Shutdown();
         ImGui::DestroyContext();
-    }
 
-    void c8_emulator::redrawScreen() {
-        SDL_SetRenderTarget(renderer, screenBuffer);
-        SDL_SetRenderDrawColor(renderer, 255*bgColor[0], 255*bgColor[1], 255*bgColor[2], SDL_ALPHA_OPAQUE);
-        SDL_RenderClear(renderer);
-        for(int i = 0; i < WINDOW_WIDTH; i++) {
-            for(int j = 0; j < WINDOW_HEIGHT; j++) {
-                SDL_SetRenderDrawColor(renderer, 255*fgColor[0], 255*fgColor[1], 255*fgColor[2], SDL_ALPHA_OPAQUE);
-                if(pixels[j*WINDOW_WIDTH + i]) {
-                    SDL_RenderDrawPoint(renderer, i, j);
-                }
-            }
-        }
-        SDL_SetRenderTarget(renderer, nullptr);
+        SDL_DestroyWindow(window);
     }
 
     void c8_emulator::clearScreen() {
-        SDL_SetRenderTarget(renderer, screenBuffer);
-        SDL_SetRenderDrawColor(renderer, 255*bgColor[0], 255*bgColor[1], 255*bgColor[2], SDL_ALPHA_OPAQUE);
-        SDL_RenderClear(renderer);
-        std::fill(pixels, pixels + WINDOW_WIDTH * WINDOW_HEIGHT, 0);
-        SDL_SetRenderTarget(renderer, nullptr);
+        std::fill(pixels, pixels + WINDOW_WIDTH * WINDOW_HEIGHT, false);
+        screenUpdateFlag = true;
     }
 
     void c8_emulator::drawSprite(const uint8_t *sprite, uint8_t x, uint8_t y, uint8_t n, uint8_t &VF) {
-        SDL_SetRenderTarget(renderer, screenBuffer);
         VF = 0;
         x = x % WINDOW_WIDTH;
         y = y % WINDOW_HEIGHT;
@@ -295,21 +625,14 @@ namespace yac8 {
                             continue;
                     }
 
-                    bool & savedPixel = pixels[py*WINDOW_WIDTH+px];
-                    bool previous = savedPixel;
-                    savedPixel ^= value;
-                    if(savedPixel == 0 && previous == 1)
+                    uint8_t &bufferPix = pixels[py*WINDOW_WIDTH+px];
+                    uint8_t previous = bufferPix;
+                    bufferPix ^= value;
+                    if(bufferPix == 0 && previous != 0)
                         VF = 1;
-
-                    SDL_SetRenderDrawColor(renderer,
-                                           255*fgColor[0]*savedPixel + 255*bgColor[0]*(!savedPixel),
-                                           255*fgColor[1]*savedPixel + 255*bgColor[1]*(!savedPixel),
-                                           255*fgColor[2]*savedPixel + 255*bgColor[2]*(!savedPixel),
-                                           SDL_ALPHA_OPAQUE);
-                    SDL_RenderDrawPoint(renderer, px, py);
                 }
             }
         }
-        SDL_SetRenderTarget(renderer, nullptr);
+        screenUpdateFlag = true;
     }
 }
