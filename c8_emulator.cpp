@@ -24,6 +24,7 @@
 #include <mutex>
 
 #include "c8_debug.hpp"
+#include "c8_noisemaker.hpp"
 
 using std::string;
 
@@ -115,9 +116,9 @@ namespace yac8 {
         "\t\t\ttc.y -= 0.5;\n"
         "\t\t\ttc.y *= 1.0 + (dx * CRT_CURVE_AMNTy);\n"
         "\t\t\ttc.y += 0.5;\n"
-        "\t\t\tbool a = texture(tex, vec2(tc.x, 1.0-tc.y)).r > 0;\n"
+        "\t\t\tfloat a = texture(tex, vec2(tc.x, 1.0-tc.y)).r;\n"
         "\t\t\tbool b = tc.y > 1.0 || tc.x < 0.0 || tc.x > 1.0 || tc.y < 0.0;\n"
-        "\t\t\tfragColor += float(!b)*(background * float(!a) + foreground * float(a) + sin(tc.y * SCAN_LINE_MULT) * 0.02) / 49.0;\n"
+        "\t\t\tfragColor += float(!b)*(background * float(1.0-a) + foreground * float(a) + sin(tc.y * SCAN_LINE_MULT) * 0.02) / 49.0;\n"
         "\t\t}\n"
         "\t}\n"
         "}";
@@ -268,6 +269,8 @@ namespace yac8 {
         glAttachShader(shaderProgram, fragmentShader);
         glLinkProgram(shaderProgram);
 
+        c8_noisemaker noisemaker{};
+
         // setup hardware API hooks
         c8_hardware_api hardware_api{};
         hardware_api.draw_sprite = [&](const uint8_t *sprite, uint8_t x, uint8_t y, uint8_t n, uint8_t &VF) { drawSprite(sprite, x, y, n, VF); };
@@ -299,6 +302,8 @@ namespace yac8 {
         state.loadROM((const uint8_t*)romData.data(), romData.size());
         state.loadTypography(yac8::default_typography_buffer);
 
+        bool is_noisemaker_testing = false;
+
         bool run = true;
         bool incompatible_flag = false;
         bool incompatible_dismissed = false;
@@ -307,6 +312,15 @@ namespace yac8 {
 
         while(run) {
             ImGuiIO& io = ImGui::GetIO();
+
+            // handle audio
+            if (state.st != 0) {
+                if(!is_noisemaker_testing)
+                    noisemaker.play();
+            } else {
+                if(!is_noisemaker_testing)
+                    noisemaker.stop();
+            }
 
             // handle timer ticks
             if(!debug_state.enabled || !debug_state.freezeTimers) {
@@ -411,12 +425,26 @@ namespace yac8 {
                     ImGui::ColorPicker3("Foreground Color", fgColor);
                     ImGui::EndMenu();
                 }
-                if(ImGui::BeginMenu("Screen Simulation"))
+                if(ImGui::BeginMenu("CRT Screen"))
                 {
                     ImGui::SliderFloat("Screen Curve X", &screenCurveX, 0.0f, 2.0f);
                     ImGui::SliderFloat("Screen Curve Y", &screenCurveY, 0.0f, 2.0f);
                     ImGui::SliderInt("Scan Line Frequency", &scanLineMult, 0, 1250);
                     ImGui::SliderFloat("Softness", &softness, 0.0f, 5.0f);
+                    ImGui::SliderFloat("Screen Decay Factor", &screenDecayFactor, 0.0f, 0.9f);
+                    ImGui::EndMenu();
+                }
+                if(ImGui::BeginMenu("Buzzer")) {
+                    ImGui::SliderFloat("Volume", &noisemaker.volume, 0.0f, 3.0f);
+                    ImGui::SliderFloat("Pitch", &noisemaker.pitch, 0.1f, 3.0f);
+                    ImGui::Button("Test");
+                    if(ImGui::IsItemActive()){
+                        is_noisemaker_testing = true;
+                        noisemaker.play();
+                    } else if(is_noisemaker_testing) {
+                        is_noisemaker_testing = false;
+                        noisemaker.stop();
+                    }
                     ImGui::EndMenu();
                 }
                 if(ImGui::BeginMenu("Debugger")) {
@@ -433,27 +461,20 @@ namespace yac8 {
                     ImGui::Text("systemvoidgames.com");
                     ImGui::EndMenu();
                 }
-                ImGui::EndMainMenuBar();
-            }
-
-            if(ImGui::BeginPopup("Incompatible ROM")) {
-                ImGui::TextColored(ImVec4{1.0f, 0.0f, 0.0f, 1.0f}, "Unrecognized instructions detected.\nThis ROM may be incompatible.");
-                if(ImGui::Button("Ok")) {
-                    incompatible_dismissed = true;
-                    ImGui::CloseCurrentPopup();
+                if(debug_state.paused) {
+                    ImGui::TextColored(ImVec4{1.0f,0.5f,0.5f,1.0f}," | Paused");
                 }
-                ImGui::EndPopup();
-            }
-
-            if(incompatible_flag && !incompatible_dismissed) {
-                ImGui::OpenPopup("Incompatible ROM");
+                if(incompatible_flag) {
+                    ImGui::TextColored(ImVec4{1.0f,0.5f,0.5f,1.0f}," | Possibly Incompatible ROM");
+                }
+                ImGui::EndMainMenuBar();
             }
 
             if(debug_state.enabled) {
                 if(ImGui::Begin("Debugger", &debug_state.enabled))
                 {
                     if(incompatible_flag) {
-                        ImGui::TextColored(ImVec4{1.0f, 0.0f, 0.0f, 1.0f}, "Unrecognized instructions detected.\nThis ROM may be incompatible.");
+                        ImGui::TextColored(ImVec4{1.0f, 0.0f, 0.0f, 1.0f}, "Unrecognized instructions detected.\nThis emulator only supports the Cowgod-spec Chip8\nSuper-Chip8, XO-Chip, etc. are not supported.");
                     }
                     ImGui::Columns(2);
                     ImGui::TextColored(ImVec4{0.0f, 1.0f, 0.0f, 1.0f}, "%s", (string("PC=") + print_register(state.pc)).c_str());
@@ -534,14 +555,20 @@ namespace yac8 {
 
             glBindTexture(GL_TEXTURE_2D, screenBufferTex);
 
-            // expensive operation: copying pixel buffer from cpu to gpu
-            if(screenUpdateFlag) {
-                screenUpdateFlag = false;
-                glTexSubImage2D(
-                        GL_TEXTURE_2D, 0, 0, 0,
-                        WINDOW_WIDTH, WINDOW_HEIGHT,
-                        GL_RED, GL_UNSIGNED_BYTE, pixels);
+            // simulate phosphorescent display
+            for(int i = 0; i < sizeof(decayingPixelBuffer); i++) {
+                if(pixels[i]) decayingPixelBuffer[i] = 255;
+                else {
+                    decayingPixelBuffer[i] *= screenDecayFactor;
+                }
             }
+
+            // expensive operation: copying pixel buffer from cpu to gpu
+            screenUpdateFlag = false;
+            glTexSubImage2D(
+                    GL_TEXTURE_2D, 0, 0, 0,
+                    WINDOW_WIDTH, WINDOW_HEIGHT,
+                    GL_RED, GL_UNSIGNED_BYTE, decayingPixelBuffer);
 
             glBindTexture(GL_TEXTURE_2D, screenBufferTex);
             glActiveTexture(GL_TEXTURE0);
@@ -625,11 +652,15 @@ namespace yac8 {
                             continue;
                     }
 
-                    uint8_t &bufferPix = pixels[py*WINDOW_WIDTH+px];
+                    bool &bufferPix = pixels[py*WINDOW_WIDTH+px];
                     uint8_t previous = bufferPix;
                     bufferPix ^= value;
                     if(bufferPix == 0 && previous != 0)
                         VF = 1;
+
+                    if(bufferPix) {
+                        decayingPixelBuffer[py*WINDOW_WIDTH+px] = 255;
+                    }
                 }
             }
         }

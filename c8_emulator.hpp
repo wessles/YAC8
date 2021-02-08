@@ -55,10 +55,12 @@ namespace yac8 {
         float fgColor[4] = {141.0f/255.0f, 255.0f/255.0f, 128.0f/255.0f};
         float screenCurveX = 0.25f, screenCurveY = 0.25f;
         int scanLineMult = 1250;
-        float softness = 5.0f;
+        float softness = 4.0f;
+        float screenDecayFactor = 0.7f;
 
     public:
-        uint8_t pixels[WINDOW_WIDTH * WINDOW_HEIGHT] = {0};
+        bool pixels[WINDOW_WIDTH * WINDOW_HEIGHT] = {0};
+        uint8_t decayingPixelBuffer[WINDOW_WIDTH * WINDOW_HEIGHT] = {0};
         int processorSpeed = 1000;
         bool slowedProcessorSpeed = true;
         c8_quirks quirks{};
